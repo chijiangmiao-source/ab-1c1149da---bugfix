@@ -98,6 +98,36 @@ test.describe('规范探测串审计（浏览器）', () => {
     await expect(result).toContainText('状态族封闭');
   });
 
+  test('即时回执相同、后继下一轮可分、整体无固定串：给封闭状态族而非虚构等价类', async ({ page }) => {
+    await page.goto('/');
+    // P1/P2 对 A、B 即时回执全同，但码 A 的后继 P1/P3 可由 B 在下一轮分开；
+    // 先发 A 则 P1/P3 轨迹重合，先发 B 则 P1/P2 轨迹重合 —— 整体无固定串。
+    await fillMachine(page, {
+      positions: ['P1', 'P2', 'P3'],
+      codes: ['A', 'B'],
+      rows: {
+        P1: { A: ['0', 'P1'], B: ['0', 'P1'] },
+        P2: { A: ['0', 'P3'], B: ['0', 'P1'] },
+        P3: { A: ['0', 'P1'], B: ['1', 'P3'] },
+      },
+    });
+    await page.click('#auditBtn');
+
+    const result = page.locator('#result');
+    await expect(result).toBeVisible();
+    await expect(result).toHaveAttribute('data-outcome', 'impossible');
+    await expect(result).toContainText('不存在任何区分序列');
+    // 结构性封闭状态族依据：初态全对集合，两个码各自令一对轨迹重合
+    await expect(result).toContainText('状态族封闭');
+    await expect(result).toContainText('轨迹重合');
+    await expect(result).toContainText('P1 / P3');
+    await expect(result).toContainText('P1 / P2');
+    // 不得再虚构“P1/P2 对任意串恒同回执”的等价类结论
+    await expect(result).not.toContainText('最小化等价类反例');
+    await expect(result).not.toContainText('对任意探测码序列的完整回执串始终相同');
+    await expect(page.locator('#errors')).toBeHidden();
+  });
+
   test('非法输入：缺失转移 + 重复位置合并显示，且清除旧结论', async ({ page }) => {
     await page.goto('/');
     // 先做一次成功审计，产生旧结论

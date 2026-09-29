@@ -8,6 +8,7 @@ import {
   pairIndex,
   applyCode,
   precompute,
+  simulateReceipts,
 } from '../src/audit.js';
 
 // ---------------------------------------------------------------------------
@@ -197,6 +198,33 @@ test('等价但后继相互跳转：后继始终同属一个等价类', () => {
   assert.deepEqual(r.equivalence.pair, ['P1', 'P2']);
   assert.ok(r.equivalence.evidence.every(e => e.successorsStillEquivalent));
   void m;
+});
+
+test('多轮细化才可分的位置不得留在等价类：级联拆分与真等价对共存', () => {
+  // S1→S2→S3→S4 链上即时回执相同，但 S4 的 A 回执不同，
+  // 细分沿链逐级回传，3 轮后 S1..S4 全部拆开；E1/E2 则真正等价。
+  const m = machine(['S1', 'S2', 'S3', 'S4', 'E1', 'E2'], ['A', 'B'], {
+    S1: { A: ['0', 'S2'], B: ['0', 'S1'] },
+    S2: { A: ['0', 'S3'], B: ['0', 'S2'] },
+    S3: { A: ['0', 'S4'], B: ['0', 'S3'] },
+    S4: { A: ['1', 'S4'], B: ['0', 'S4'] },
+    E1: { A: ['0', 'E2'], B: ['1', 'E1'] },
+    E2: { A: ['0', 'E1'], B: ['1', 'E2'] },
+  });
+  const r = audit(m);
+  assert.equal(r.found, false);
+  assert.equal(r.equivalence.kind, 'class');
+  // 唯一的等价对是 E1/E2；S1..S3 虽即时回执相同，但后继级联可分，不得混入
+  assert.deepEqual(r.equivalence.witnessClass, ['E1', 'E2']);
+  assert.deepEqual(r.equivalence.allEquivalentPairs, ['E1 / E2']);
+  for (const ev of r.equivalence.evidence) {
+    assert.equal(ev.successorsStillEquivalent, true);
+  }
+  // S1/S2 确实可被分开（长度 3 的 AAA 即可），佐证它们不属于任何等价类
+  const normalized = validateInput(m);
+  normalized.codes.sort();
+  const { receipts } = simulateReceipts(normalized, ['A', 'A', 'A']);
+  assert.notDeepEqual(receipts.S1, receipts.S2);
 });
 
 // ---------------------------------------------------------------------------
@@ -400,6 +428,40 @@ function verifyImpossibilityWitness(m, r, bound, trial) {
     }
   }
 }
+
+test('即时回执相同、后继下一轮可分、整体无固定串：给封闭状态族而非虚构等价类', () => {
+  // P1/P2 对 A、B 的即时回执都相同，但码 A 的后继分别为 P1/P3，
+  // 而 P1/P3 可被码 B 在下一轮分开（回执 0/1）——P1/P2 实际可被 AB 区分。
+  // 同时整台矩阵不存在统一固定串：先发 A 则 P1/P3 轨迹重合，先发 B 则 P1/P2 轨迹重合。
+  const m = machine(['P1', 'P2', 'P3'], ['A', 'B'], {
+    P1: { A: ['0', 'P1'], B: ['0', 'P1'] },
+    P2: { A: ['0', 'P3'], B: ['0', 'P1'] },
+    P3: { A: ['0', 'P1'], B: ['1', 'P3'] },
+  });
+  const r = audit(m);
+  // 结论仍应为“不存在统一探测串”，预言机到上界深度同样找不到
+  assert.equal(r.found, false);
+  assert.equal(oracle(m, 3), null);
+  // 但 P1/P2 并非永久不可区分：AB 即可把二者分开（其余两对都可被 B 分开），
+  // 机型已最小，绝不允许给出等价类反例
+  const normalized = validateInput(m);
+  normalized.codes.sort();
+  const { receipts } = simulateReceipts(normalized, ['A', 'B']);
+  assert.notDeepEqual(receipts.P1, receipts.P2);
+  assert.equal(r.equivalence.kind, 'structural');
+  // 封闭族仅含初态全对集合：两个码都立即令一对轨迹重合
+  assert.equal(r.equivalence.states.length, 1);
+  const s0 = r.equivalence.states[0];
+  assert.equal(s0.state, 0);
+  assert.deepEqual(s0.unresolvedPairs, ['P1 / P2', 'P1 / P3', 'P2 / P3']);
+  const byCode = Object.fromEntries(s0.branches.map(b => [b.code, b]));
+  assert.equal(byCode.A.outcome, 'merge');
+  assert.deepEqual(byCode.A.mergedPairs, ['P1 / P3']);
+  assert.equal(byCode.B.outcome, 'merge');
+  assert.deepEqual(byCode.B.mergedPairs, ['P1 / P2']);
+  // 全部分支可复算：用 applyCode 独立复核封闭性
+  verifyImpossibilityWitness(m, r, 3, 'same-receipt-splittable-successor');
+});
 
 test('随机机型 ×60：与暴力枚举预言机完全一致', () => {
   const states = ['s0', 's1', 's2'];

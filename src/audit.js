@@ -285,7 +285,14 @@ export function bfsDistinguishingSequence(model) {
 //     要么落入族中另一个非空状态；故任何码串都到不了空状态。
 // ---------------------------------------------------------------------------
 
-/** Moore 式分区细化至不动点（最粗观测等价划分）。 */
+/**
+ * Moore 式分区细化至不动点（最粗观测等价划分）。
+ * 初始按各码即时回执签名分块；随后反复细化——只有上一轮同块、且每个码的
+ * 后继也同块的位置才继续留在同一块——直到块数不再变化。不动点处块内任意
+ * 两位置对每个码回执相同且后继仍同块，归纳可知任意长度码串都无法分开；
+ * 反之即时回执相同但后继可分的位置（如下一轮即可分开）必被细化拆开，
+ * 不会被误报为永久不可区分。
+ */
 function computePartition(model) {
   const { positions, codes, table } = model;
   const n = positions.length;
@@ -298,12 +305,31 @@ function computePartition(model) {
     return parts.join('\u0001');
   });
   const ids = new Map();
-  const blocks = new Array(n);
+  let blocks = new Array(n);
   let count = 0;
   signatures.forEach((signature, i) => {
     if (!ids.has(signature)) ids.set(signature, count++);
     blocks[i] = ids.get(signature);
   });
+  // 细化：同块且每个码的后继也同块才留在同一块。细化键含上一轮块号，
+  // 新划分必为旧划分的加细，块数单调不减，至多 n 轮收敛到不动点。
+  const index = new Map(positions.map((p, i) => [p, i]));
+  for (;;) {
+    const ids2 = new Map();
+    const next = new Array(n);
+    let count2 = 0;
+    for (let i = 0; i < n; i++) {
+      const succ = codes
+        .map(c => blocks[index.get(table[positions[i]][c].next)])
+        .join(',');
+      const key = `${blocks[i]}|${succ}`;
+      if (!ids2.has(key)) ids2.set(key, count2++);
+      next[i] = ids2.get(key);
+    }
+    if (count2 === count) break;
+    blocks = next;
+    count = count2;
+  }
   const byBlock = new Map();
   blocks.forEach((b, i) => {
     if (!byBlock.has(b)) byBlock.set(b, []);
