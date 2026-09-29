@@ -8,6 +8,7 @@ import {
   pairIndex,
   applyCode,
   precompute,
+  simulateReceipts,
 } from '../src/audit.js';
 
 // ---------------------------------------------------------------------------
@@ -152,6 +153,40 @@ test('轨迹重合分支必须剪枝：三对均可自适应区分但不存在�
   assert.ok(merges.length >= 1);
 });
 
+test('即时回执相同、后继下一轮可分、但整体无固定串：给结构性证明而非虚构等价类', () => {
+  // P1/P2 对两个码的即时回执都相同，但码 A 下后继分别为 P1/P3，
+  // 下一轮发 B 即可把这两个后继分开（回执 0≠1）——二者并非永久不可区分。
+  // 然而无论先发 A 还是 B，都有另一对在该前缀后轨迹重合，故不存在统一固定串。
+  const m = machine(['P1', 'P2', 'P3'], ['A', 'B'], {
+    P1: { A: ['0', 'P1'], B: ['0', 'P1'] },
+    P2: { A: ['0', 'P3'], B: ['0', 'P1'] },
+    P3: { A: ['0', 'P1'], B: ['1', 'P3'] },
+  });
+  const r = audit(m);
+  assert.equal(r.found, false);
+  // 机型已最小：P1/P3、P2/P3 由 B 直接分开，P1/P2 由 AB 分开
+  const { receipts } = simulateReceipts(validateInput(m), ['A', 'B']);
+  assert.notDeepEqual(receipts.P1, receipts.P2); // P1/P2 确实可被 AB 分开
+  // 不存在固定串（暴力预言机复核到深度 6）
+  assert.equal(oracle(m, 6), null);
+  // 关键：不得把 P1/P2 虚构为“任意串恒同回执”的等价类反例
+  assert.equal(r.equivalence.kind, 'structural');
+  assert.equal(r.equivalence.pair, undefined);
+  // 封闭未分对状态族：初态为全部三对，两个码都在本前缀令一对轨迹重合
+  assert.equal(r.equivalence.states.length, 1);
+  const st0 = r.equivalence.states[0];
+  assert.equal(st0.state, 0);
+  assert.deepEqual(st0.unresolvedPairs, ['P1 / P2', 'P1 / P3', 'P2 / P3']);
+  const brA = st0.branches.find(b => b.code === 'A');
+  const brB = st0.branches.find(b => b.code === 'B');
+  assert.equal(brA.outcome, 'merge');
+  assert.deepEqual(brA.mergedPairs, ['P1 / P3']);
+  assert.equal(brB.outcome, 'merge');
+  assert.deepEqual(brB.mergedPairs, ['P1 / P2']);
+  // 全部分支独立复算（重建掩码状态族，逐码复核重合/族内转移）
+  verifyImpossibilityWitness(m, r, 3, 'same-receipt-divergent-successor');
+});
+
 // ---------------------------------------------------------------------------
 // 等价类反例
 // ---------------------------------------------------------------------------
@@ -197,6 +232,35 @@ test('等价但后继相互跳转：后继始终同属一个等价类', () => {
   assert.deepEqual(r.equivalence.pair, ['P1', 'P2']);
   assert.ok(r.equivalence.evidence.every(e => e.successorsStillEquivalent));
   void m;
+});
+
+test('真实等价且后继落入另一等价类：类证明逐码后继仍同类', () => {
+  // P1≈P2：码 A 的后继 P3/P4 属于另一个等价类，码 B 的后继是彼此自身；
+  // 只有细化到不动点才能证明两组各自等价、且组间可区分。
+  const m = machine(['P1', 'P2', 'P3', 'P4'], ['A', 'B'], {
+    P1: { A: ['0', 'P3'], B: ['0', 'P1'] },
+    P2: { A: ['0', 'P4'], B: ['0', 'P2'] },
+    P3: { A: ['1', 'P3'], B: ['0', 'P3'] },
+    P4: { A: ['1', 'P4'], B: ['0', 'P4'] },
+  });
+  const r = audit(m);
+  assert.equal(r.found, false);
+  assert.equal(r.equivalence.kind, 'class');
+  assert.deepEqual(r.equivalence.pair, ['P1', 'P2']);
+  assert.deepEqual(r.equivalence.witnessClass, ['P1', 'P2']);
+  assert.deepEqual(r.equivalence.allEquivalentPairs, ['P1 / P2', 'P3 / P4']);
+  // 码 A 下 P1/P2 的后继分别是 P3/P4：不同位置，但同属另一等价类
+  const evA = r.equivalence.evidence.find(e => e.code === 'A');
+  assert.equal(evA.responseBoth, '0');
+  assert.equal(evA.nextI, 'P3');
+  assert.equal(evA.nextJ, 'P4');
+  assert.deepEqual(evA.nextClassI, ['P3', 'P4']);
+  assert.deepEqual(evA.nextClassJ, ['P3', 'P4']);
+  for (const ev of r.equivalence.evidence) {
+    assert.equal(ev.successorsStillEquivalent, true);
+  }
+  // 独立复核：witness 对在任意长度 ≤4 的码串下回执恒同
+  verifyImpossibilityWitness(m, r, 4, 'cross-class-successor-equivalence');
 });
 
 // ---------------------------------------------------------------------------
@@ -401,6 +465,40 @@ function verifyImpossibilityWitness(m, r, bound, trial) {
   }
 }
 
+/**
+ * 独立判定机型是否存在观测等价对：任一对位置在 bound 深度内都分不开即等价。
+ * （n 状态机的可分性在深度 n(n-1)/2 内必然显现，此处作为暴力最小化检查。）
+ */
+function anyEquivalentPair(model, bound) {
+  const { positions, codes, table } = model;
+  const receipt = (p, seq) => {
+    const out = [];
+    let cur = p;
+    for (const c of seq) {
+      out.push(table[cur][c].response);
+      cur = table[cur][c].next;
+    }
+    return out.join('|');
+  };
+  for (let a = 0; a < positions.length; a++) {
+    for (let b = a + 1; b < positions.length; b++) {
+      let separable = false;
+      let level = [[]];
+      for (let d = 0; d <= bound && !separable; d++) {
+        for (const seq of level) {
+          if (receipt(positions[a], seq) !== receipt(positions[b], seq)) {
+            separable = true;
+            break;
+          }
+        }
+        level = level.flatMap(seq => codes.map(c => [...seq, c]));
+      }
+      if (!separable) return true;
+    }
+  }
+  return false;
+}
+
 test('随机机型 ×60：与暴力枚举预言机完全一致', () => {
   const states = ['s0', 's1', 's2'];
   const codes = ['A', 'B'];
@@ -421,6 +519,13 @@ test('随机机型 ×60：与暴力枚举预言机完全一致', () => {
     if (expected === null) {
       assert.equal(r.found, false, `trial ${trial}：预言机找不到，BFS 却声称找到`);
       verifyImpossibilityWitness(m, r, bound, trial);
+      // 反例类型必须与暴力最小化检查一致：存在等价对 ⇔ 必须给等价类证明
+      const hasEq = anyEquivalentPair(m, bound);
+      assert.equal(
+        r.equivalence.kind === 'class',
+        hasEq,
+        `trial ${trial}：等价类/结构性判定与暴力最小化检查不符`,
+      );
     } else {
       assert.equal(r.found, true, `trial ${trial}：预言机找到 ${expected.join('')}，BFS 失败`);
       assert.ok(r.sequence.length <= bound, `trial ${trial}：长度超过理论上界`);

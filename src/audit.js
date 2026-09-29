@@ -206,7 +206,15 @@ export function bfsDistinguishingSequence(model) {
   if (!found) {
     const partition = computePartition(model);
     if (partition.hasNontrivialClass) {
-      return { found: false, ...equivalenceProof(model, partition) };
+      const proof = equivalenceProof(model, partition);
+      // 防御性自检：等价类反例必须逐码自洽——每个码的后继都仍在同一等价类，
+      // 才能断言“任意长度码串回执恒同”；否则退化为结构性封闭族证明。
+      if (
+        proof.equivalence &&
+        proof.equivalence.evidence.every(ev => ev.successorsStillEquivalent)
+      ) {
+        return { found: false, ...proof };
+      }
     }
     return {
       found: false,
@@ -285,25 +293,45 @@ export function bfsDistinguishingSequence(model) {
 //     要么落入族中另一个非空状态；故任何码串都到不了空状态。
 // ---------------------------------------------------------------------------
 
-/** Moore 式分区细化至不动点（最粗观测等价划分）。 */
+/**
+ * Moore 式分区细化至不动点（最粗观测等价划分）。
+ * 初始按各码回执向量分块；随后反复按“每个码的后继所在块”细分，直至块数稳定。
+ * 只做一轮回执分组会把“即时回执相同、但后继可被分开”的位置误判为永久等价，
+ * 因此必须迭代到不动点：此时同块位置对每个码回执相同且后继仍同块，
+ * 归纳可知它们对任意长度的码串回执恒同。
+ */
 function computePartition(model) {
   const { positions, codes, table } = model;
   const n = positions.length;
-  const signatures = positions.map(p => {
-    const parts = [];
-    for (const c of codes) {
-      const t = table[p][c];
-      parts.push(t.response);
+  const index = new Map(positions.map((p, i) => [p, i]));
+  const responseSig = positions.map(p =>
+    codes.map(c => table[p][c].response).join('\u0001'),
+  );
+  const nextIdx = positions.map(p => codes.map(c => index.get(table[p][c].next)));
+
+  const group = keyOf => {
+    const ids = new Map();
+    const grouped = new Array(n);
+    let count = 0;
+    for (let i = 0; i < n; i++) {
+      const key = keyOf(i);
+      if (!ids.has(key)) ids.set(key, count++);
+      grouped[i] = ids.get(key);
     }
-    return parts.join('\u0001');
-  });
-  const ids = new Map();
-  const blocks = new Array(n);
-  let count = 0;
-  signatures.forEach((signature, i) => {
-    if (!ids.has(signature)) ids.set(signature, count++);
-    blocks[i] = ids.get(signature);
-  });
+    return { blocks: grouped, count };
+  };
+
+  let { blocks, count } = group(i => responseSig[i]);
+  for (;;) {
+    // 细化单调（只会细分不会合并），块数不变即到达不动点。
+    const refined = group(
+      i => responseSig[i] + '\u0001' + nextIdx[i].map(ni => blocks[ni]).join('\u0002'),
+    );
+    if (refined.count === count) break;
+    blocks = refined.blocks;
+    count = refined.count;
+  }
+
   const byBlock = new Map();
   blocks.forEach((b, i) => {
     if (!byBlock.has(b)) byBlock.set(b, []);
